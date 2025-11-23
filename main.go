@@ -57,7 +57,7 @@ var (
 // ================= MAIN =================
 
 func main() {
-	log.Printf("Starting Xray exporter %s...", Version)
+	log.Printf("Starting Xray exporter %s...\n", Version)
 
 	// Prometheus registry
 	reg := prometheus.NewRegistry()
@@ -71,21 +71,18 @@ func main() {
 		log.Fatal("Connect to Xray failed:", err)
 	}
 	defer conn.Close()
-
 	client := statsService.NewStatsServiceClient(conn)
 
 	// Handle shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Start scrape loop (SINGLE THREAD)
+	// Start scrape loop
 	go scrapeLoop(ctx, client)
 
 	// Start HTTP server
 	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-
 	addr := fmt.Sprintf(":%d", AppConfig.Port)
-
 	log.Printf("Exporter listening on %s/metrics\n", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
@@ -97,7 +94,7 @@ func scrapeLoop(ctx context.Context, client statsService.StatsServiceClient) {
 
 	failCount := 0
 
-	// Give Xray some time on startup
+	// Initial delay
 	time.Sleep(2 * time.Second)
 
 	for {
@@ -106,35 +103,21 @@ func scrapeLoop(ctx context.Context, client statsService.StatsServiceClient) {
 			log.Println("Scrape loop stopped")
 			return
 		default:
-			var hasError bool
-
-			// scrape traffic
-			if err := scrapeTraffic(client); err != nil {
-				log.Println("scrapeTraffic error:", err)
-				hasError = true
-			}
-
-			// scrape user ip online
-			if err := scrapeUserIPOnline(client); err != nil {
-				log.Println("scrapeUserIPOnline error:", err)
-				hasError = true
-			}
-
-			// set status
-			if hasError {
+			err := scrapeTraffic(client)
+			if err != nil {
 				failCount++
 				xrayUp.Set(0)
+				log.Println("scrapeTraffic error:", err)
 			} else {
 				failCount = 0
 				xrayUp.Set(1)
 			}
 
-			// dynamic sleep (protect xray if failing)
+			// Adjust sleep
 			sleep := scrapeInterval
 			if failCount >= 3 {
 				sleep = failInterval
 			}
-
 			time.Sleep(sleep)
 		}
 	}
@@ -154,41 +137,31 @@ func scrapeTraffic(c statsService.StatsServiceClient) error {
 		return err
 	}
 
-	for _, stat := range resp.Stat {
-		parseAndSetTraffic(stat.Name, stat.Value)
-	}
-
-	return nil
-}
-
-func scrapeUserIPOnline(c statsService.StatsServiceClient) error {
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-	defer cancel()
-
-	resp, err := c.QueryStats(ctx, &statsService.QueryStatsRequest{
-		Pattern: "user>>>",
-		Reset_:  false,
-	})
-	if err != nil {
-		return err
-	}
-
+	// Reset metrics
+	xrayTraffic.Reset()
 	xrayUserIPOnline.Reset()
 
+	// Extract users and parse traffic
+	users := make(map[string]struct{})
+
 	for _, stat := range resp.Stat {
-
-		user, ok := parseUser(stat.Name)
-		if !ok {
-			continue
+		if strings.HasPrefix(stat.Name, "user>>>") {
+			user, ok := parseUser(stat.Name)
+			if ok {
+				users[user] = struct{}{}
+			}
 		}
-
+		parseAndSetTraffic(stat.Name, stat.Value)
+	}
+	// Query online IPs for each user (serial)
+	for user := range users {
 		ctx2, cancel2 := context.WithTimeout(context.Background(), rpcTimeout)
 		ipResp, err := c.GetStatsOnlineIpList(ctx2, &statsService.GetStatsRequest{
-			Name: "user>>>" + user,
+			Name: "user>>>" + user + ">>>online",
 		})
 		cancel2()
-
 		if err != nil {
+			log.Printf("GetStatsOnlineIpList error for user %s: %v", user, err)
 			continue
 		}
 
@@ -207,11 +180,6 @@ func parseAndSetTraffic(name string, value int64) {
 	if len(parts) < 4 {
 		return
 	}
-
-	// parts example:
-	// user>>>alice>>>traffic>>>uplink
-	// inbound>>>api>>>traffic>>>downlink
-
 	typ := parts[0]
 	nameLabel := parts[1]
 	direction := parts[3]
