@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"net/http"
 	"strings"
@@ -39,21 +40,22 @@ var (
 )
 
 func main() {
+	// 通过命令行参数指定 Xray API 地址
+	xrayAPI := flag.String("xray-api", "127.0.0.1:8080", "Xray API gRPC server address")
+	flag.Parse()
+
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(xrayTraffic)
 	reg.MustRegister(xrayUserIPOnline)
 	reg.MustRegister(xrayUp)
 
-	conn, err := grpc.NewClient("127.0.0.1:22222", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// 使用用户传入的地址建立 gRPC 连接
+	conn, err := grpc.NewClient(*xrayAPI, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatal("Connect to Xray failed:", err)
 	}
-	defer func(conn *grpc.ClientConn) {
-		err := conn.Close()
-		if err != nil {
+	defer conn.Close()
 
-		}
-	}(conn)
 	client := statsService.NewStatsServiceClient(conn)
 
 	go func() {
