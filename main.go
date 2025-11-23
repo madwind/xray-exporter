@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
-	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	statsService "github.com/xtls/xray-core/app/stats/command"
@@ -16,6 +19,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// ================= CONFIG =================
+
+var (
+	scrapeInterval = 5 * time.Second
+	failInterval   = 15 * time.Second
+	rpcTimeout     = 3 * time.Second
+)
+
+// ================= METRICS =================
+
 var (
 	xrayTraffic = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -24,6 +37,7 @@ var (
 		},
 		[]string{"type", "name", "direction"},
 	)
+
 	xrayUserIPOnline = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "xray_user_ip_online",
@@ -31,6 +45,7 @@ var (
 		},
 		[]string{"name", "ip"},
 	)
+
 	xrayUp = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "xray_up",
@@ -39,18 +54,19 @@ var (
 	)
 )
 
-func main() {
-	// 通过命令行参数指定 Xray API 地址
-	xrayAPI := flag.String("xray-api", "127.0.0.1:8080", "Xray API gRPC server address")
-	flag.Parse()
+// ================= MAIN =================
 
+func main() {
+	log.Printf("Starting Xray exporter %s...", Version)
+
+	// Prometheus registry
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(xrayTraffic)
 	reg.MustRegister(xrayUserIPOnline)
 	reg.MustRegister(xrayUp)
 
-	// 使用用户传入的地址建立 gRPC 连接
-	conn, err := grpc.NewClient(*xrayAPI, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// gRPC connection
+	conn, err := grpc.NewClient(AppConfig.XrayApi, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatal("Connect to Xray failed:", err)
 	}
@@ -58,50 +74,98 @@ func main() {
 
 	client := statsService.NewStatsServiceClient(conn)
 
-	go func() {
-		for {
-			if err := scrapeTraffic(client); err != nil {
-				xrayUp.Set(0)
-				log.Println("scrapeTraffic error:", err)
-			} else {
-				xrayUp.Set(1)
-			}
-			if err := scrapeUserIPOnline(client); err != nil {
-				log.Println("scrapeUserIPOnline error:", err)
-			}
-			time.Sleep(5 * time.Second)
-		}
-	}()
+	// Handle shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
+	// Start scrape loop (SINGLE THREAD)
+	go scrapeLoop(ctx, client)
+
+	// Start HTTP server
 	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	log.Println("Exporter listening on :9550/metrics")
-	log.Fatal(http.ListenAndServe(":9550", nil))
+
+	addr := fmt.Sprintf(":%d", AppConfig.Port)
+
+	log.Printf("Exporter listening on %s/metrics\n", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
+// ================= SCRAPE LOOP =================
+
+func scrapeLoop(ctx context.Context, client statsService.StatsServiceClient) {
+	log.Println("Scrape loop started (single-thread mode)")
+
+	failCount := 0
+
+	// Give Xray some time on startup
+	time.Sleep(2 * time.Second)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Scrape loop stopped")
+			return
+		default:
+			var hasError bool
+
+			// scrape traffic
+			if err := scrapeTraffic(client); err != nil {
+				log.Println("scrapeTraffic error:", err)
+				hasError = true
+			}
+
+			// scrape user ip online
+			if err := scrapeUserIPOnline(client); err != nil {
+				log.Println("scrapeUserIPOnline error:", err)
+				hasError = true
+			}
+
+			// set status
+			if hasError {
+				failCount++
+				xrayUp.Set(0)
+			} else {
+				failCount = 0
+				xrayUp.Set(1)
+			}
+
+			// dynamic sleep (protect xray if failing)
+			sleep := scrapeInterval
+			if failCount >= 3 {
+				sleep = failInterval
+			}
+
+			time.Sleep(sleep)
+		}
+	}
+}
+
+// ================= SCRAPE FUNCTIONS =================
+
 func scrapeTraffic(c statsService.StatsServiceClient) error {
-	resp, err := c.QueryStats(context.Background(), &statsService.QueryStatsRequest{
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancel()
+
+	resp, err := c.QueryStats(ctx, &statsService.QueryStatsRequest{
 		Pattern: "",
 		Reset_:  false,
 	})
 	if err != nil {
 		return err
 	}
+
 	for _, stat := range resp.Stat {
 		parseAndSetTraffic(stat.Name, stat.Value)
 	}
+
 	return nil
 }
 
-func parseAndSetTraffic(name string, value int64) {
-	parts := strings.Split(name, ">>>")
-	if len(parts) < 4 {
-		return
-	}
-	xrayTraffic.WithLabelValues(parts[0], parts[1], parts[3]).Set(float64(value))
-}
-
 func scrapeUserIPOnline(c statsService.StatsServiceClient) error {
-	resp, err := c.QueryStats(context.Background(), &statsService.QueryStatsRequest{
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancel()
+
+	resp, err := c.QueryStats(ctx, &statsService.QueryStatsRequest{
 		Pattern: "user>>>",
 		Reset_:  false,
 	})
@@ -110,17 +174,55 @@ func scrapeUserIPOnline(c statsService.StatsServiceClient) error {
 	}
 
 	xrayUserIPOnline.Reset()
+
 	for _, stat := range resp.Stat {
-		user := strings.Split(stat.Name, ">>>")[1]
-		ipResp, err := c.GetStatsOnlineIpList(context.Background(), &statsService.GetStatsRequest{
+
+		user, ok := parseUser(stat.Name)
+		if !ok {
+			continue
+		}
+
+		ctx2, cancel2 := context.WithTimeout(context.Background(), rpcTimeout)
+		ipResp, err := c.GetStatsOnlineIpList(ctx2, &statsService.GetStatsRequest{
 			Name: "user>>>" + user,
 		})
+		cancel2()
+
 		if err != nil {
 			continue
 		}
+
 		for ip := range ipResp.Ips {
 			xrayUserIPOnline.WithLabelValues(user, ip).Set(1)
 		}
 	}
+
 	return nil
+}
+
+// ================= PARSERS =================
+
+func parseAndSetTraffic(name string, value int64) {
+	parts := strings.Split(name, ">>>")
+	if len(parts) < 4 {
+		return
+	}
+
+	// parts example:
+	// user>>>alice>>>traffic>>>uplink
+	// inbound>>>api>>>traffic>>>downlink
+
+	typ := parts[0]
+	nameLabel := parts[1]
+	direction := parts[3]
+
+	xrayTraffic.WithLabelValues(typ, nameLabel, direction).Set(float64(value))
+}
+
+func parseUser(statName string) (string, bool) {
+	parts := strings.Split(statName, ">>>")
+	if len(parts) < 2 {
+		return "", false
+	}
+	return parts[1], true
 }
