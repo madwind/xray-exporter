@@ -91,6 +91,9 @@ func (c *XrayTrafficCollector) Collect(ch chan<- prometheus.Metric) {
 
 	// 2. 遍历并上报为 Counter
 	for _, stat := range resp.Stat {
+		if stat.Value == 0 {
+			continue
+		}
 		// 确保只处理流量相关的统计项
 		if strings.Contains(stat.Name, ">>>traffic>>>") {
 			parts := strings.Split(stat.Name, ">>>")
