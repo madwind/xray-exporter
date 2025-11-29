@@ -61,7 +61,7 @@ func NewXrayTrafficCollector(client statsService.StatsServiceClient) *XrayTraffi
 		client: client,
 		trafficDesc: prometheus.NewDesc(
 			"xray_traffic_bytes_total",
-			"Xray traffic statistics (user/inbound/outbound)",
+			"Xray traffic statistics",
 			[]string{"type", "name", "direction"}, // 标签：user/inbound/outbound, 对应的名称, up/down
 			nil,
 		),
