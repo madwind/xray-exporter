@@ -1,10 +1,10 @@
 module xray-exporter
 
-go 1.25
+go 1.25.5
 
 require (
 	github.com/prometheus/client_golang v1.23.2
-	github.com/xtls/xray-core v1.251208.0
+	github.com/xtls/xray-core v1.260113.0
 	google.golang.org/grpc v1.78.0
 )
 
@@ -18,9 +18,9 @@ require (
 	github.com/prometheus/procfs v0.19.2 // indirect
 	github.com/sagernet/sing v0.7.13 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
-	golang.org/x/net v0.48.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
-	golang.org/x/text v0.32.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
-	google.golang.org/protobuf v1.36.10 // indirect
+	golang.org/x/net v0.49.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/text v0.33.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260112192933-99fd39fd28a9 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 )
