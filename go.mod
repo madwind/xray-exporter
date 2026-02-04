@@ -4,7 +4,7 @@ go 1.25.6
 
 require (
 	github.com/prometheus/client_golang v1.23.2
-	github.com/xtls/xray-core v1.260202.0
+	github.com/xtls/xray-core v1.260204.0
 	google.golang.org/grpc v1.78.0
 )
 
