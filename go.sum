@@ -103,6 +103,8 @@ github.com/xtls/xray-core v1.260123.0 h1:FCaIDJ1ThRaG9b8TpqNNq3hIcPTN+24vPWQY3s9
 github.com/xtls/xray-core v1.260123.0/go.mod h1:xfHDVg861cIAR5WjwEVKHr/G/HMHSGSC9j3LZmt6sKM=
 github.com/xtls/xray-core v1.260202.0 h1:dYduYxGlkn/krSQJbmksbTtCdRe8OFb3YwpuXXEJG5c=
 github.com/xtls/xray-core v1.260202.0/go.mod h1:cxzYFZrxu1B1NtPjHsqv4UzgDvRA71mV4rXYH4KtO7Q=
+github.com/xtls/xray-core v1.260204.0 h1:GHtCLBsqIPbjS13uIE7pqo0sQaMNbE+60t6ob4KOlwY=
+github.com/xtls/xray-core v1.260204.0/go.mod h1:cxzYFZrxu1B1NtPjHsqv4UzgDvRA71mV4rXYH4KtO7Q=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
 go.opentelemetry.io/auto/sdk v1.2.1/go.mod h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=
 go.opentelemetry.io/otel v1.38.0 h1:RkfdswUDRimDg0m2Az18RKOsnI8UDzppJAtj01/Ymk8=
@@ -162,6 +164,8 @@ google.golang.org/genproto/googleapis/rpc v0.0.0-20260122232226-8e98ce8d340d h1:
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260122232226-8e98ce8d340d/go.mod h1:j9x/tPzZkyxcgEFkiKEEGxfvyumM01BEtsW8xzOahRQ=
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260202165425-ce8ad4cf556b h1:GZxXGdFaHX27ZSMHudWc4FokdD+xl8BC2UJm1OVIEzs=
 google.golang.org/genproto/googleapis/rpc v0.0.0-20260202165425-ce8ad4cf556b/go.mod h1:j9x/tPzZkyxcgEFkiKEEGxfvyumM01BEtsW8xzOahRQ=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20260203192932-546029d2fa20 h1:Jr5R2J6F6qWyzINc+4AM8t5pfUz6beZpHp678GNrMbE=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20260203192932-546029d2fa20/go.mod h1:j9x/tPzZkyxcgEFkiKEEGxfvyumM01BEtsW8xzOahRQ=
 google.golang.org/grpc v1.78.0 h1:K1XZG/yGDJnzMdd/uZHAkVqJE+xIDOcmdSFZkBUicNc=
 google.golang.org/grpc v1.78.0/go.mod h1:I47qjTo4OKbMkjA/aOOwxDIiPSBofUtQUI5EfpWvW7U=
 google.golang.org/protobuf v1.36.10 h1:AYd7cD/uASjIL6Q9LiTjz8JLcrh/88q5UObnmY3aOOE=
