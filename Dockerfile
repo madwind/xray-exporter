@@ -1,19 +1,16 @@
-FROM golang:1.26.1-trixie AS builder
+FROM rust:1.98.1-alpine AS builder
 
 WORKDIR /app
+RUN apk add --no-cache musl-dev
 
-COPY . .
+COPY Cargo.toml ./
+COPY src ./src
 
-ARG BUILDTIME
-ARG TARGETOS
-ARG TARGETARCH
-
-RUN CGO_ENABLED=0 \
-    go build -o xray-exporter -ldflags="-s -w" .
+RUN cargo build --release
 
 FROM scratch
 
 WORKDIR /app
-COPY --from=builder /app/xray-exporter .
+COPY --from=builder /app/target/release/xray-exporter ./xray-exporter
 
 ENTRYPOINT ["./xray-exporter"]
