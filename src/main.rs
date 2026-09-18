@@ -1,21 +1,17 @@
 use std::{
-    collections::HashMap,
     env,
     error::Error,
     fmt::Write as _,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use axum::{
-    Router,
-    extract::State,
-    http::header,
-    response::IntoResponse,
-    routing::get,
-};
+use axum::{Router, extract::State, http::header, response::IntoResponse, routing::get};
 use prost::Message;
-use tokio::{net::TcpListener, time::sleep};
+use tokio::{
+    net::TcpListener,
+    time::{Instant, Interval, MissedTickBehavior, interval, timeout},
+};
 use tonic::{
     Request, Status,
     client::Grpc,
@@ -25,7 +21,7 @@ use tonic::{
 use tonic_prost::ProstCodec;
 
 const SCRAPE_INTERVAL: Duration = Duration::from_secs(5);
-const FAIL_INTERVAL: Duration = Duration::from_secs(15);
+const ONLINE_TTL: Duration = Duration::from_secs(15);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 type SharedState = Arc<RwLock<MetricsSnapshot>>;
@@ -63,18 +59,71 @@ struct OnlineMetric {
 }
 
 #[derive(Clone, Debug, Default)]
+struct CollectorHealth {
+    errors_total: u64,
+    last_success_timestamp_seconds: f64,
+}
+
+impl CollectorHealth {
+    fn record<T>(&mut self, collector: &str, result: Result<T, Status>) -> Option<T> {
+        match result {
+            Ok(value) => {
+                self.last_success_timestamp_seconds = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                Some(value)
+            }
+            Err(error) => {
+                self.errors_total = self.errors_total.saturating_add(1);
+                eprintln!("Xray {collector} scrape failed: {error}");
+                None
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct MetricsSnapshot {
     up: bool,
     traffic: Vec<TrafficMetric>,
     online: Vec<OnlineMetric>,
+    online_updated_at: Option<Instant>,
+    scrape_duration_seconds: f64,
+    traffic_health: CollectorHealth,
+    online_health: CollectorHealth,
 }
 
-#[derive(Clone, PartialEq, Message)]
-struct GetStatsRequest {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(bool, tag = "2")]
-    reset: bool,
+impl MetricsSnapshot {
+    fn update(&mut self, result: ScrapeResult) {
+        self.up = result.traffic.is_ok() && result.online.is_ok();
+        self.scrape_duration_seconds = result.duration.as_secs_f64();
+        if let Some(traffic) = self.traffic_health.record("traffic", result.traffic) {
+            self.traffic = traffic;
+        }
+        if let Some(online) = self.online_health.record("online", result.online) {
+            self.online = online;
+            self.online_updated_at = Some(Instant::now());
+        }
+    }
+
+    fn fresh_online(&self) -> &[OnlineMetric] {
+        // Check at HTTP render time too, so expiry does not depend on the next scrape.
+        if self
+            .online_updated_at
+            .is_some_and(|at| at.elapsed() < ONLINE_TTL)
+        {
+            &self.online
+        } else {
+            &[]
+        }
+    }
+}
+
+struct ScrapeResult {
+    traffic: Result<Vec<TrafficMetric>, Status>,
+    online: Result<Vec<OnlineMetric>, Status>,
+    duration: Duration,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -99,21 +148,36 @@ struct QueryStatsResponse {
     stat: Vec<Stat>,
 }
 
+// Xray v26.9.9 app/stats/command/command.proto.
 #[derive(Clone, PartialEq, Message)]
-struct GetStatsOnlineIpListResponse {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(map = "string, int64", tag = "2")]
-    ips: HashMap<String, i64>,
+struct GetUsersStatsRequest {
+    #[prost(bool, tag = "1")]
+    include_traffic: bool,
+    #[prost(bool, tag = "2")]
+    reset: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct GetAllOnlineUsersRequest {}
+struct OnlineIPEntry {
+    #[prost(string, tag = "1")]
+    ip: String,
+    #[prost(int64, tag = "2")]
+    last_seen: i64,
+}
 
 #[derive(Clone, PartialEq, Message)]
-struct GetAllOnlineUsersResponse {
-    #[prost(string, repeated, tag = "1")]
-    users: Vec<String>,
+struct UserStat {
+    #[prost(string, tag = "1")]
+    email: String,
+    #[prost(message, repeated, tag = "2")]
+    ips: Vec<OnlineIPEntry>,
+    // Field 3 (traffic) is unused: QueryStats supplies the complete counters.
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct GetUsersStatsResponse {
+    #[prost(message, repeated, tag = "1")]
+    users: Vec<UserStat>,
 }
 
 #[derive(Clone)]
@@ -146,37 +210,18 @@ impl StatsClient {
             .map(|response| response.into_inner())
     }
 
-    async fn get_all_online_users(&self) -> Result<GetAllOnlineUsersResponse, Status> {
+    async fn get_users_stats(&self) -> Result<GetUsersStatsResponse, Status> {
         let mut grpc = self.inner.clone();
         grpc.ready()
             .await
             .map_err(|error| Status::unknown(format!("service not ready: {error}")))?;
 
-        let request = Request::new(GetAllOnlineUsersRequest {});
-        let path = PathAndQuery::from_static(
-            "/xray.app.stats.command.StatsService/GetAllOnlineUsers",
-        );
-        let codec = ProstCodec::<GetAllOnlineUsersRequest, GetAllOnlineUsersResponse>::default();
-
-        grpc.unary(request, path, codec)
-            .await
-            .map(|response| response.into_inner())
-    }
-
-    async fn get_online_ips(&self, user: &str) -> Result<GetStatsOnlineIpListResponse, Status> {
-        let mut grpc = self.inner.clone();
-        grpc.ready()
-            .await
-            .map_err(|error| Status::unknown(format!("service not ready: {error}")))?;
-
-        let request = Request::new(GetStatsRequest {
-            name: format!("user>>>{user}>>>online"),
+        let request = Request::new(GetUsersStatsRequest {
+            include_traffic: false,
             reset: false,
         });
-        let path = PathAndQuery::from_static(
-            "/xray.app.stats.command.StatsService/GetStatsOnlineIpList",
-        );
-        let codec = ProstCodec::<GetStatsRequest, GetStatsOnlineIpListResponse>::default();
+        let path = PathAndQuery::from_static("/xray.app.stats.command.StatsService/GetUsersStats");
+        let codec = ProstCodec::<GetUsersStatsRequest, GetUsersStatsResponse>::default();
 
         grpc.unary(request, path, codec)
             .await
@@ -223,35 +268,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn scrape_schedule() -> Interval {
+    let mut ticks = interval(SCRAPE_INTERVAL);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticks
+}
+
 async fn scrape_loop(state: SharedState, client: StatsClient) {
-    let mut fail_count = 0_u32;
-    sleep(Duration::from_secs(2)).await;
-
+    let mut ticks = scrape_schedule();
     loop {
-        match scrape(&client).await {
-            Ok(mut snapshot) => {
-                snapshot.up = true;
-                fail_count = 0;
-                *write_state(&state) = snapshot;
-            }
-            Err(error) => {
-                fail_count = fail_count.saturating_add(1);
-                write_state(&state).up = false;
-                eprintln!("Xray scrape failed: {error}");
-            }
-        }
-
-        let interval = if fail_count >= 3 {
-            FAIL_INTERVAL
-        } else {
-            SCRAPE_INTERVAL
-        };
-        sleep(interval).await;
+        ticks.tick().await;
+        let result = scrape(&client).await;
+        write_state(&state).update(result);
     }
 }
 
-async fn scrape(client: &StatsClient) -> Result<MetricsSnapshot, Status> {
-    let response = client.query_stats().await?;
+async fn scrape(client: &StatsClient) -> ScrapeResult {
+    let started = Instant::now();
+    // Keep the two collectors independent. The outer timeouts also cover
+    // channel readiness and response-body decoding, not just response headers.
+    let (traffic, online) = tokio::join!(
+        timeout(RPC_TIMEOUT, client.query_stats()),
+        timeout(RPC_TIMEOUT, client.get_users_stats()),
+    );
+    let traffic = traffic
+        .unwrap_or_else(|_| Err(Status::deadline_exceeded("QueryStats timed out")))
+        .map(traffic_metrics);
+    let online = online
+        .unwrap_or_else(|_| Err(Status::deadline_exceeded("GetUsersStats timed out")))
+        .map(online_metrics);
+
+    ScrapeResult {
+        traffic,
+        online,
+        duration: started.elapsed(),
+    }
+}
+
+fn traffic_metrics(response: QueryStatsResponse) -> Vec<TrafficMetric> {
     let mut traffic = Vec::new();
 
     for stat in response.stat {
@@ -281,52 +335,40 @@ async fn scrape(client: &StatsClient) -> Result<MetricsSnapshot, Status> {
         (&a.kind, &a.name, &a.direction).cmp(&(&b.kind, &b.name, &b.direction))
     });
 
-    let mut users = client.get_all_online_users().await?.users;
-    users.sort_unstable();
-    users.dedup();
+    traffic
+}
 
+fn online_metrics(response: GetUsersStatsResponse) -> Vec<OnlineMetric> {
     let mut online = Vec::new();
-    for user in users {
-        match client.get_online_ips(&user).await {
-            Ok(response) => {
-                for ip in response.ips.into_keys() {
-                    online.push(OnlineMetric {
-                        name: user.clone(),
-                        ip,
-                    });
-                }
-            }
-            Err(error) => {
-                eprintln!("GetStatsOnlineIpList failed for {user}: {error}");
-            }
+    for user in response.users {
+        for entry in user.ips {
+            online.push(OnlineMetric {
+                name: user.email.clone(),
+                ip: entry.ip,
+            });
         }
     }
-
     online.sort_unstable_by(|a, b| (&a.name, &a.ip).cmp(&(&b.name, &b.ip)));
-
-    Ok(MetricsSnapshot {
-        up: true,
-        traffic,
-        online,
-    })
+    online.dedup_by(|a, b| a.name == b.name && a.ip == b.ip);
+    online
 }
 
 async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     let snapshot = read_state(&state).clone();
     let body = render_metrics(&snapshot);
 
-    ([
-        (
+    (
+        [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
-        ),
-    ], body)
+        )],
+        body,
+    )
 }
 
 fn render_metrics(snapshot: &MetricsSnapshot) -> String {
-    let mut output = String::with_capacity(
-        256 + snapshot.traffic.len() * 96 + snapshot.online.len() * 72,
-    );
+    let mut output =
+        String::with_capacity(256 + snapshot.traffic.len() * 96 + snapshot.online.len() * 72);
 
     output.push_str("# HELP xray_traffic_bytes_total Xray traffic statistics\n");
     output.push_str("# TYPE xray_traffic_bytes_total counter\n");
@@ -340,13 +382,47 @@ fn render_metrics(snapshot: &MetricsSnapshot) -> String {
         let _ = writeln!(output, "\"}} {}", metric.value);
     }
 
-    output.push_str("# HELP xray_up Whether Xray is reachable (1=up, 0=down)\n");
+    output.push_str("# HELP xray_up Whether both Xray collectors succeeded in the latest scrape (1=yes, 0=no)\n");
     output.push_str("# TYPE xray_up gauge\n");
     let _ = writeln!(output, "xray_up {}", u8::from(snapshot.up));
 
+    output.push_str("# HELP xray_scrape_duration_seconds Duration of the latest Xray scrape\n");
+    output.push_str("# TYPE xray_scrape_duration_seconds gauge\n");
+    let _ = writeln!(
+        output,
+        "xray_scrape_duration_seconds {}",
+        snapshot.scrape_duration_seconds
+    );
+
+    output.push_str("# HELP xray_scrape_errors_total Failed Xray scrapes by collector\n");
+    output.push_str("# TYPE xray_scrape_errors_total counter\n");
+    for (collector, health) in [
+        ("traffic", &snapshot.traffic_health),
+        ("online", &snapshot.online_health),
+    ] {
+        let _ = writeln!(
+            output,
+            "xray_scrape_errors_total{{collector=\"{collector}\"}} {}",
+            health.errors_total
+        );
+    }
+
+    output.push_str("# HELP xray_scrape_last_success_timestamp_seconds Unix time of last successful scrape by collector (0=never)\n");
+    output.push_str("# TYPE xray_scrape_last_success_timestamp_seconds gauge\n");
+    for (collector, health) in [
+        ("traffic", &snapshot.traffic_health),
+        ("online", &snapshot.online_health),
+    ] {
+        let _ = writeln!(
+            output,
+            "xray_scrape_last_success_timestamp_seconds{{collector=\"{collector}\"}} {}",
+            health.last_success_timestamp_seconds
+        );
+    }
+
     output.push_str("# HELP xray_user_ip_online User online status per IP (1=online)\n");
     output.push_str("# TYPE xray_user_ip_online gauge\n");
-    for metric in &snapshot.online {
+    for metric in snapshot.fresh_online() {
         output.push_str("xray_user_ip_online{name=\"");
         push_label_value(&mut output, &metric.name);
         output.push_str("\",ip=\"");
@@ -369,11 +445,15 @@ fn push_label_value(output: &mut String, value: &str) {
 }
 
 fn read_state(state: &SharedState) -> std::sync::RwLockReadGuard<'_, MetricsSnapshot> {
-    state.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    state
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn write_state(state: &SharedState) -> std::sync::RwLockWriteGuard<'_, MetricsSnapshot> {
-    state.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    state
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 async fn shutdown_signal() {
