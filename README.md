@@ -79,3 +79,9 @@ cargo fmt --check
 
 Image: `madwind/xray-exporter`. The exporter does not include Xray-core; deploy
 Xray-core v26.9.9 separately.
+
+GitHub Actions uses the latest stable Rust toolchain to build static musl
+binaries on native amd64 and arm64 runners,
+then packages them into `scratch` images and publishes the multi-architecture
+`latest` and package-version tags. The Dockerfile expects a prebuilt executable
+at `dist/xray-exporter` in the build context.
